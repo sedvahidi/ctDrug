@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import math
-from torch import nn, Tensor
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.optim import SGD, Adam
 from torch.nn import MSELoss, L1Loss
@@ -16,20 +15,17 @@ import numpy as np
 import sys
 from model_auto import Seq2SeqTransformer, PositionalEncoding, generate_square_subsequent_mask, create_mask
 from utils import top_k_top_p_filtering, open_file, read_csv_file, load_sets
-import vocabulary as mv
 import dataset as md
 import torch.utils.data as tud
 from utils import read_delimited_file
 import os.path
 import glob
-import math
 from collections import Counter
 from torch import Tensor
 import io
 import time
 from topk import topk_filter
 import wandb
-
 
 # === unified checkpoint helpers ===
 def save_checkpoint(checkpoint, filename="checkpoint_last.pth"):
@@ -48,44 +44,11 @@ def load_checkpoint(filename, model, optimizer=None, scheduler=None, map_locatio
     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
     return model, optimizer, scheduler, start_epoch, best_val_loss
 
-
-#sed#
-#loading protein embeddings for teacher
-pro_emb = pd.read_json('seqID_embedding.json', orient='records') #seqID_mean_embeddings.json
-pro_emb['embedding'] = pro_emb['embedding'].apply(np.array)
-pro_smi = pd.read_pickle("/content/drive/MyDrive/exp1_pro_smi_dg_smi/seqID_seq_smi_with_emb.pkl")
+pro_smi = pd.read_pickle("seqID_seq_smi_with_emb.pkl")
+seqid_to_emb = dict(zip(pro_smi['seq_id'], pro_smi['chemberta_emb']))
 torch.manual_seed(0)
 
-from create_data import prot_cat, drug_cat
-import numpy as np
-import torch
-from model import ImageNet
-
-def get_imagedta_model(device, path='model__davis.pth'):
-    model = ImageNet()
-    model.load_state_dict(torch.load(path, map_location=device))
-    model.eval()
-    return model.to(device)
-
-
-def imagedtapredict(smiles_list, protein_list, model):
-    affinities = []
-    device = next(model.parameters()).device
-
-    for smile, protein in zip(smiles_list, protein_list):
-        try:
-            dg = torch.LongTensor([np.asarray(drug_cat(smile))]).to(device)
-            pr = torch.LongTensor([np.asarray(prot_cat(protein))]).to(device)
-
-            with torch.no_grad():
-                output = model(dg, pr)
-                affinities.append(output.item())
-        except Exception as e:
-            print(f"Failed on ({smile}, {protein}): {e}")
-            affinities.append(0.0)
-    return affinities
-
-def evaluate(model, valid_iter, linear, vocabulary, tokenizer, device, imagedta_model=None, loss_fn=None):
+def evaluate(model, valid_iter, linear, vocabulary, tokenizer, device, epoch, EMB_SIZE, loss_fn=None):
     model.eval()
     total_loss = 0
     n_batches = 0
@@ -100,66 +63,32 @@ def evaluate(model, valid_iter, linear, vocabulary, tokenizer, device, imagedta_
             tgt_input = tgt[:-1, :]
             tgt_mask, tgt_padding_mask = create_mask(tgt_input)
 
-            protein_seqs = []
             if _target is None:
                 target_stu = torch.zeros((tgt_input.size(1), 1024), dtype=torch.float).to(device)
             else:
                 targetemb_stu=[]
                 for t in _target:
-                  targetemb_stu.append(pro_smi.loc[pro_smi['seq_id'] == t]['chemberta_emb'].values[0])
-                  protein_seqs.append(pro_smi.loc[pro_smi['seq_id'] == t]['seq'].values[0])
+                  targetemb_stu.append(seqid_to_emb[t])
                 target_stu = linear(torch.FloatTensor(np.stack(targetemb_stu))).to(device) ##sed##
 
-        logits = model(tgt_input, tgt_mask, tgt_padding_mask, target_stu)
-        tgt_out = tgt[1:, :]
-        
-        logits_flat = logits.reshape(-1, logits.shape[-1])
-        labels_flat = tgt_out.reshape(-1)
-        ce_loss = loss_fn(logits_flat, labels_flat) 
-
-        affinity_term = torch.tensor(0.0, device=device) 
-        if imagedta_model is not None and protein_seqs:
-            generated_tokens = torch.argmax(logits, dim=-1)
-            tokens_np = generated_tokens.cpu().numpy()
-            generated_smiles = []
-            for i in range(tokens_np.shape[1]):
-                token_ids = tokens_np[:, i]
-                tokens = vocabulary.decode(token_ids)
-                smiles = tokenizer.untokenize(tokens)
-                generated_smiles.append(smiles)
-            try:
-                affinity_scores = imagedtapredict(generated_smiles, protein_seqs, imagedta_model)
-                affinity_scores = torch.tensor(affinity_scores, device=device, dtype=torch.float)
-                if torch.isfinite(affinity_scores).all():
-                   affinity_term = -affinity_scores.mean()
-                else:
-                   affinity_term = torch.tensor(0.0, device=device)
-            except Exception as e:
-                    print(f"Affinity prediction failed during eval: {e}")
-                    affinity_term = torch.tensor(0.0, device=device)
-
-        scale_ce = ce_loss.detach().mean()
-        scale_aff = affinity_term.detach().mean()
-        lambda_aff = scale_ce / (scale_aff + 1e-8)
-        loss = ce_loss + lambda_aff * affinity_term
-        total_loss += loss.item()
-        n_batches += 1
+            logits = model(tgt_input, tgt_mask, tgt_padding_mask, target_stu)
+            tgt_out = tgt[1:, :]
+            
+            logits_flat = logits.reshape(-1, logits.shape[-1])
+            labels_flat = tgt_out.reshape(-1)
+            ce_loss = loss_fn(logits_flat, labels_flat) 
+            loss = ce_loss 
+            total_loss += loss.item()
+            n_batches += 1
 
     avg_loss = total_loss / n_batches
     wandb.log({
-    "epoch": epoch,
-    "val_loss": avg_loss,
-    "ce_loss": ce_loss.item(),
-    "affinity_loss": affinity_term.item(),
-    "lambda_affinity":lambda_aff
+        "val_loss": total_loss / n_batches,
+        "epoch": epoch
     })
     return avg_loss
-
-##################### start change #############################
-def train_epoch(model, train_iter, optimizer, teacher, T, alpha, linear, vocabulary, tokenizer, device, epoch, imagedta_model=None, loss_fn=None):
-    ##################### teacher to eval mode #####################
-    teacher.eval()
-    ##################### end change ###############################
+    
+def train_epoch(model, train_iter, optimizer, linear, vocabulary, tokenizer, device, epoch, EMB_SIZE, loss_fn=None):
 
     model.train()
     total_loss = 0
@@ -175,97 +104,47 @@ def train_epoch(model, train_iter, optimizer, teacher, T, alpha, linear, vocabul
         tgt_input = tgt[:-1, :]
         tgt_mask, tgt_padding_mask = create_mask(tgt_input)
 
-        protein_seqs=[]
         if _target is None:
-            target_stu = torch.zeros((tgt_input.size()[-1], 1024), dtype=torch.float).to(device)
-            target_t = torch.zeros((tgt_input.size()[-1], 1024), dtype=torch.float).to(device)
+            target_stu = torch.zeros((tgt_input.size(1), EMB_SIZE), dtype=torch.float).to(device)
         else:
-            targetemb_t=[]
             targetemb_stu=[]
             for t in _target:
-              targetemb_t.append(pro_emb.loc[pro_emb['seq_id'] == t]['embedding'].values[0])
-              targetemb_stu.append(pro_smi.loc[pro_smi['seq_id'] == t]['chemberta_emb'].values[0])
-              protein_seqs.append(pro_smi.loc[pro_smi['seq_id'] == t]['seq'].values[0])
+              targetemb_stu.append(seqid_to_emb[t])
 
-            target_t = torch.FloatTensor(targetemb_t).to(device)
             target_stu = linear(torch.FloatTensor(np.stack((targetemb_stu)))).to(device)
 
         logits = model(tgt_input, tgt_mask, tgt_padding_mask, target_stu) 
-
-        ##################### start change #############################
-        ##################### get teacher output #######################
-        with torch.no_grad():
-            teacher_output = teacher(tgt_input, tgt_mask, tgt_padding_mask, target_t)
-        ##################### end change ###############################
-
         optimizer.zero_grad()
-      
         tgt_out = tgt[1:,:]
-
-        ##################### start change #############################
-        ##################### change loss for Distillation #############
-        kd_loss = loss_kd(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1), teacher_output.reshape(-1, teacher_output.shape[-1]), T)
-        ##################### end change ###############################
         ce_loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_out.reshape(-1)) 
         
-        # Generate SMILES
-        generated_tokens = torch.argmax(logits, dim=-1)
-        tokens_np = generated_tokens.cpu().numpy()
-        generated_smiles = []
-        for i in range(tokens_np.shape[1]):
-            token_ids = tokens_np[:, i]  
-            tokens = vocabulary.decode(token_ids) 
-            smiles = tokenizer.untokenize(tokens)
-            generated_smiles.append(smiles)
-
-        with torch.no_grad():
-            affinity_term = torch.tensor(0.0, device=device)
-            if imagedta_model is not None and protein_seqs:
-               affinity_scores = imagedtapredict(generated_smiles, protein_seqs, imagedta_model)
-               affinity_scores = torch.tensor(affinity_scores, device=device, dtype=torch.float)
-               if torch.isfinite(affinity_scores).all():
-                   affinity_term = -affinity_scores.mean()
-               else:
-                   print("Bad affinity scores detected. Skipping affinity loss for this batch.")
-                   affinity_term = torch.tensor(0.0, device=device)
-                   
-        ce_kd_loss = alpha * kd_loss + (1.0 - alpha) * ce_loss
-        scale_ce_kd = ce_kd_loss.detach().mean()
-        scale_aff = affinity_term.detach().mean()
-        lambda_aff = scale_ce_kd / (scale_aff + 1e-8)
-        loss = ce_kd_loss + lambda_aff * affinity_term
-
-        #loss = ce_dis_loss + lambda_affinity * affinity_term
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        loss = ce_loss 
         loss.backward()
-
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        
         if idx % 100 == 0:
             print('Train Epoch: {}\t Loss: {:.6f}'.format(epoch, loss.item()))     
         total_loss += loss.item()
 
     print('====> Epoch: {0} total loss: {1:.4f}.'.format(epoch, total_loss))
     wandb.log({
-    "epoch": epoch,
-    "train_loss": total_loss / len(train_iter),
-    "ce_loss": ce_loss.item(),
-    "kd_loss": kd_loss.item() if 'kd_loss' in locals() else 0.0,
-    "affinity_loss": affinity_term.item(),
-    "lambda_affinity":lambda_aff
+        "train_loss": total_loss / len(train_iter),
+        "epoch": epoch
     })
-
     return total_loss / len(train_iter)
 
-def greedy_decode(model, max_len, start_symbol, target, linear):
+def greedy_decode(model, max_len, start_symbol, EOS_IDX, target, linear, device, EMB_SIZE):
 
     ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long).to(device)
     for i in range(max_len-1):
         b = 1
         s = max_len
-        if target == 0:
-            _target = torch.zeros((b), dtype=torch.int32).to(device)
+        if target == "0":
+            _target = torch.zeros((b, EMB_SIZE), dtype=torch.int32).to(device)
         else:
-            _target = linear(torch.FloatTensor(pro_smi.loc[pro_smi['seq_id'] == target]['chemberta_emb'].values[0])).to(device) ##sed##
+            _target = torch.FloatTensor(seqid_to_emb[target]).unsqueeze(0).to(device)
+            _target = linear(_target)
 
         tgt_mask = (generate_square_subsequent_mask(ys.size(0))
                                     .type(torch.bool)).to(device)
@@ -297,10 +176,8 @@ if __name__ == '__main__':
     arg_parser.add_argument('--embedding_size', default=200, type=int)
     arg_parser.add_argument('--loadmodel', default=False, action="store_true")
     arg_parser.add_argument("--loaddata", default=False, action="store_true")
+    arg_parser.add_argument('--num', default=10000, type=int)
     args = arg_parser.parse_args()
-
-    T = 2
-    alpha = 0
     
     print('==========  Transformer x->x ==============')
     EMB_SIZE = args.d_model
@@ -314,7 +191,6 @@ if __name__ == '__main__':
     BOS_IDX = 1
     EOS_IDX = 2
     DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    device = args.device
 
     mol_list0_train = list(read_delimited_file('train.smi'))
     mol_list0_test = list(read_delimited_file('test.smi'))
@@ -334,6 +210,7 @@ if __name__ == '__main__':
     vocabulary = mv.create_vocabulary(smiles_list=mol_list, tokenizer=mv.SMILESTokenizer())
 
     linear=nn.Linear(in_features=768, out_features=1024) ## protein smiles chemberta embedding
+    linear = linear.to(DEVICE)
  
     train_data = md.Dataset(mol_list0_train, vocabulary, mv.SMILESTokenizer())
     test_data = md.Dataset(mol_list0_test, vocabulary, mv.SMILESTokenizer())
@@ -343,20 +220,10 @@ if __name__ == '__main__':
     TGT_VOCAB_SIZE = len(vocabulary)
 
     
-
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-    ##################### start change #############################
-    ##################### define loss function #####################
-    def loss_kd(outputs, labels, teacher_outputs, T=5):
-        PAD_IDX = 0
-        kd_loss = F.kl_div(F.log_softmax(outputs / T, dim=1), F.softmax(teacher_outputs / T, dim=1), reduction='batchmean') * (T*T)
-        return kd_loss
-    ##################### end change ###############################
-
     transformer = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, 
                                  EMB_SIZE, SRC_VOCAB_SIZE, TGT_VOCAB_SIZE,
                                  FFN_HID_DIM, args=args)
-
     for p in transformer.parameters():
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
@@ -370,16 +237,14 @@ if __name__ == '__main__':
         transformer.parameters(), lr=0.0001, betas=(0.9, 0.98), eps=1e-9
     )
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95) 
-
+    
     wandb.init(
     project="drug-protein-generation",  
-    name="exp2_linear_pro_smi_dg_smi_results",                        
+    name="exp2_linChemberta_pro_smi_dg_smi",                        
     config={
         "learning_rate": lr,
         "batch_size": BATCH_SIZE,
         "epochs": NUM_EPOCHS,
-        "alpha": alpha,
-        "temperature": T,
     }
     )
     config = wandb.config
@@ -391,17 +256,17 @@ if __name__ == '__main__':
         if args.loadmodel:
             print("loading checkpoint")
             transformer, optimizer, scheduler, start_epoch, best_val_loss= load_checkpoint(
-                args.path, transformer
+                args.path, transformer, optimizer, scheduler
             )
             min_loss=best_val_loss
             
         for epoch in range(start_epoch, NUM_EPOCHS+1):
             start_time = time.time()
-            train_loss = train_epoch(transformer, train_iter, optimizer, linear, DEVICE, epoch, loss_fn)
+            train_loss = train_epoch(transformer, train_iter, optimizer, linear, vocabulary, mv.SMILESTokenizer(), DEVICE, epoch, loss_fn)
             scheduler.step()
             end_time = time.time()
             
-            val_loss = evaluate(transformer, val_iter, linear, vocabulary, mv.SMILESTokenizer(), device, imagedta_model, lambda_affinity, loss_fn)
+            val_loss = evaluate(transformer, val_iter, linear, vocabulary, mv.SMILESTokenizer(), DEVICE,epoch, imagedta_model, loss_fn)
             if val_loss < min_loss:
                 min_loss = val_loss
                 checkpoint = {
@@ -436,7 +301,7 @@ if __name__ == '__main__':
         mol_list2_train = mol_list2_train * 3
 
         mol_list2_val = list(read_delimited_file('DRD2_valid.txt'))
-        target_list2_val = ['P14416'] * len(mol_list2_train) + ['P61169'] * len(mol_list2_train) + ['P61168'] * len(mol_list2_train)
+        target_list2_val = ['P14416'] * len(mol_list2_val) + ['P61169'] * len(mol_list2_val) + ['P61168'] * len(mol_list2_val)
         mol_list2_val = mol_list2_val * 3
         
         mol_list1_train.extend(mol_list2_train)
@@ -464,33 +329,16 @@ if __name__ == '__main__':
             min_loss=best_val_loss
 
         imagedta_model = get_imagedta_model(device=DEVICE)
-        #lambda_affinity=0.4
-        ##################### start change #############################
-        ##################### define teacher ###########################
-        teacher = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS,
-                                         EMB_SIZE, len(vocabulary), len(vocabulary),
-                                         FFN_HID_DIM, args=args)
-
-        for p in teacher.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-        teacher = teacher.to(DEVICE)
-        teacher.load_state_dict(torch.load('model_finetune_repeated.h5'))
-        ##################### end change ###############################
+    
         wandb.watch(transformer, log="all", log_freq=100)
         for epoch in range(start_epoch, NUM_EPOCHS+1):
             start_time = time.time()
-            ##################### start change #############################
-            ##################### change input for train_epoch #############
-
-            train_loss = train_epoch(transformer, train_iter, optimizer, teacher, T, alpha, linear, vocabulary, mv.SMILESTokenizer(), DEVICE, epoch, imagedta_model, loss_fn=loss_fn)
-            ##################### end change ###############################
+            train_loss = train_epoch(transformer, train_iter, optimizer, linear, vocabulary, mv.SMILESTokenizer(), DEVICE, epoch, imagedta_model, loss_fn=loss_fn)
 
             scheduler.step()
             end_time = time.time()
 
-            val_loss = evaluate(transformer, val_iter, linear, vocabulary, mv.SMILESTokenizer(), device, imagedta_model, loss_fn=loss_fn)
+            val_loss = evaluate(transformer, val_iter, linear, vocabulary, mv.SMILESTokenizer(), DEVICE,epoch, imagedta_model, loss_fn=loss_fn)
             if val_loss < min_loss:
                 min_loss = val_loss
                 checkpoint = {
@@ -513,14 +361,13 @@ if __name__ == '__main__':
             transformer, optimizer, scheduler, start_epoch, best_val_loss= load_checkpoint(
                 args.path, transformer
             )
-        device = args.device
-        transformer.to(device)
+        transformer.to(DEVICE)
         transformer.eval()
         _target = args.target
         print('Target: {0}'.format(_target))
-        f=open("Results/{0}.txt".format(_target),'a')
-        for i in range(10000):
-            ybar = greedy_decode(transformer, max_len=100, start_symbol=BOS_IDX, target=_target, linear=linear).flatten()
+        f=open("Results/T_"+str(T)+"_alpha_"+str(alpha)+"/{0}.txt".format(_target),'a')
+        for i in range(args.num):
+            ybar = greedy_decode(transformer, max_len=100, start_symbol=BOS_IDX, target=_target, linear=linear, device=DEVICE).flatten()
             #print(ybar)
             ybar = mv.SMILESTokenizer().untokenize(vocabulary.decode(ybar.to('cpu').data.numpy()))
             #print('prediction')
