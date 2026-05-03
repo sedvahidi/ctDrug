@@ -1,11 +1,11 @@
 import argparse
 import torch
+import copy
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import math
 from torch import nn, Tensor
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from torch.optim import SGD, Adam
 from torch.nn import MSELoss, L1Loss
 from torch.nn.init import xavier_uniform_
@@ -20,14 +20,10 @@ import torch.utils.data as tud
 import os.path
 import glob
 import math
-import torch
-import torch.nn as nn
 from collections import Counter
 from torch import Tensor
 import io
 import time
-from torch.nn import (TransformerEncoder, TransformerDecoder,
-                      TransformerEncoderLayer, TransformerDecoderLayer)
 
 vocabulary = mv.tokens_struct()
 PAD_IDX = vocabulary.pad
@@ -39,36 +35,124 @@ EOS_IDX = vocabulary.eos
 class Seq2SeqTransformer(nn.Module):
     def __init__(self, num_encoder_layers: int, num_decoder_layers: int,
                  emb_size: int, src_vocab_size: int, tgt_vocab_size: int,
-                 dim_feedforward:int = 1024, dropout:float = 0.1, args = None):
+                 dim_feedforward:int , dropout:float = 0.1, args = None):
         super(Seq2SeqTransformer, self).__init__()
         
-        decoder_layer = TransformerDecoderLayer(d_model=emb_size, nhead=args.nhead,
-                                                dim_feedforward=dim_feedforward)
-        self.transformer_decoder = TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+        decoder_layer = DecoderLayer(d_model=emb_size,
+        nhead=args.nhead,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout)
         
+        self.transformer_decoder = Decoder(
+        decoder_layer,
+        num_layers=num_decoder_layers
+        )
 
         tgt_vocab_size = src_vocab_size        
         self.generator = nn.Linear(emb_size, tgt_vocab_size)
-        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
         self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
         self.positional_encoding = PositionalEncoding(emb_size, dropout=dropout)
 
-    def forward(self, trg: Tensor, tgt_mask: Tensor, tgt_padding_mask: Tensor, target: Tensor):
-        
-        tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
-        s, b = trg.size()
+    def forward(self, drugs: Tensor, tgt_mask: Tensor, tgt_padding_mask: Tensor, target: Tensor):
+
+        tgt_emb = self.positional_encoding(self.tgt_tok_emb(drugs))
+
+        # transpose to (S, B, E)
+        tgt_emb = tgt_emb
+
+        s, b = drugs.size()
         memory = target.unsqueeze(0).repeat(s, 1, 1)
-        outs = self.transformer_decoder(tgt_emb, memory, tgt_mask, None,
-                                        tgt_padding_mask)
+
+        outs = self.transformer_decoder(
+            tgt_emb,
+            memory,
+            tgt_mask=tgt_mask,
+            tgt_padding_mask=tgt_padding_mask
+        )
+
         return self.generator(outs)
+        
+        
+class Decoder(nn.Module):
+    def __init__(self, decoder_layer, num_layers):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [copy.deepcopy(decoder_layer) for _ in range(num_layers)]
+        )
 
+    def forward(self, tgt, memory, tgt_mask=None, tgt_padding_mask=None):
+        output = tgt
 
-    def decode(self, tgt: Tensor, tgt_mask: Tensor, target: Tensor):
-        s, b = tgt.size()
-        memory = target.unsqueeze(0).repeat(s, 1, 1)
-        return self.transformer_decoder(self.positional_encoding(
-                          self.tgt_tok_emb(tgt)), memory,
-                          tgt_mask)
+        for layer in self.layers:
+            output = layer(
+                output,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_padding_mask=tgt_padding_mask
+            )
+
+        return output
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, nhead,
+                 dim_feedforward:int = 1024, dropout:float = 0.1, args = None):
+        super(DecoderLayer, self).__init__()
+        
+        ###################start_change##################
+        # Self-attention
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        
+        # Cross-attention (target protein as memory)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        
+        # Feedforward
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        # Normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        
+        # Dropout
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        
+        self.activation = F.relu
+        
+        ###################end_change##################
+
+    def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Tensor=None , tgt_padding_mask: Tensor=None):
+        
+        ###################start_change##################
+        #1. Masked self-attention
+        tgt2 = self.self_attn(
+            tgt, tgt, tgt,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_padding_mask
+        )[0]
+        
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        
+        #2. Cross-attention
+        tgt2 = self.cross_attn(
+            tgt, memory, memory
+        )[0]
+
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        #3. Feedforward
+        tgt2 = self.linear2(self.activation(self.linear1(tgt)))
+
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+
+        return tgt
+        ###################end_change##################
+    
 
 ######################################################################
 # Text tokens are represented by using token embeddings. Positional
