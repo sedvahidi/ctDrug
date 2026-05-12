@@ -1,3 +1,6 @@
+# ctDrug: Conditional Target-Aware Drug Design
+
+This repository contains the official implementation of **ctDrug**, a ligand-based autoregressive framework for target-aware de novo molecular generation.
 ## Reproduction of Results
 
 ### Main Results (Tables 2-3)
@@ -23,6 +26,7 @@ python models/main/prott5_selfies.py --batch_size 512 --mode train
 ### Inference (Generate Molecules)
 
 DRD2 (P14416)
+
 HTR1A (P08908)
 
 ```bash
