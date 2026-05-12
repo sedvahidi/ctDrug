@@ -19,5 +19,8 @@
 
 ### Inference (Generate Molecules)
 
+DRD2 (P14416)
+HTR1A (P08908)
+
 ```bash
 python models/main/prott5_smiles.py --mode infer --target P14416 --num 10000
