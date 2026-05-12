@@ -1,6 +1,19 @@
 # ctDrug: Conditional Target-Aware Drug Design
 
 This repository contains the official implementation of **ctDrug**, a ligand-based autoregressive framework for target-aware de novo molecular generation.
+
+##Requirements:
+
+Python 3.8+
+
+PyTorch 1.12+
+
+RDKit
+
+pandas, numpy, scikit-learn
+
+transformers (for ProtT5/ChemBERTa)
+
 ## Reproduction of Results
 
 ### Main Results (Tables 2-3)
