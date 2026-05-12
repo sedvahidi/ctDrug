@@ -4,15 +4,17 @@ This repository contains the official implementation of **ctDrug**, a ligand-bas
 
 ## Requirements:
 
-Python 3.8+
+### Python Packages
+- PyTorch 1.12+
+- RDKit
+- Transformers (for ProtT5/ChemBERTa)
+- SELFIES
+- pandas, numpy, scikit-learn
+- UMAP, matplotlib, seaborn
 
-PyTorch 1.12+
-
-RDKit
-
-pandas, numpy, scikit-learn
-
-transformers (for ProtT5/ChemBERTa)
+### External Tools
+- **AutoDock Vina** (for molecular docking)
+  - Version: 1.2.3 or higher
 
 ## Reproduction of Results
 
