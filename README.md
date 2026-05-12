@@ -2,7 +2,7 @@
 
 This repository contains the official implementation of **ctDrug**, a ligand-based autoregressive framework for target-aware de novo molecular generation.
 
-##Requirements:
+## Requirements:
 
 Python 3.8+
 
