@@ -13,7 +13,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 import sys
-from model_auto import Seq2SeqTransformer, PositionalEncoding, generate_square_subsequent_mask, create_mask
+from ..ablation.model_auto_cross import Seq2SeqTransformer, PositionalEncoding, generate_square_subsequent_mask, create_mask
 from utils import top_k_top_p_filtering, open_file, read_csv_file, load_sets
 import dataset as md
 import torch.utils.data as tud
