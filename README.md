@@ -5,8 +5,8 @@ This repository contains the official implementation of **ctDrug**, a ligand-bas
 
 ### Main Results (Tables 2-3)
 #### Train
-python models/main/prott5_smiles.py --batch_size 512 --mode train 
-python models/main/prott5_selfies.py --batch_size 512 --mode train 
+`python models/main/prott5_smiles.py --batch_size 512 --mode train `
+`python models/main/prott5_selfies.py --batch_size 512 --mode train `
 #### Fine-tune
 | Model | Command |
 |-------|---------|
