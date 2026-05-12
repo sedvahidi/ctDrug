@@ -26,7 +26,7 @@ from torch import Tensor
 import io
 import time
 from topk import topk_filter
-
+s_vocab = mv.selfies_tokens_struct()
 # === unified checkpoint helpers ===
 def save_checkpoint(checkpoint, filename="checkpoint_last.pth"):
     torch.save(checkpoint, filename)
@@ -187,16 +187,15 @@ if __name__ == '__main__':
     NUM_DECODER_LAYERS = args.layer
     NUM_EPOCHS = args.epoch
     
-    vocabulary = mv.tokens_struct()
-    PAD_IDX = vocabulary.pad
-    BOS_IDX = vocabulary.bos
-    EOS_IDX = vocabulary.eos
+    PAD_IDX = s_vocab.pad
+    BOS_IDX = s_vocab.bos
+    EOS_IDX = s_vocab.eos
     
     DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     
     BATCH_SIZE = args.batch_size
-    SRC_VOCAB_SIZE = vocabulary.get_tokens_length()
-    drg_VOCAB_SIZE = vocabulary.get_tokens_length()
+    SRC_VOCAB_SIZE = s_vocab.get_tokens_length()
+    drg_VOCAB_SIZE = s_vocab.get_tokens_length()
     
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     transformer = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, 
@@ -219,8 +218,8 @@ if __name__ == '__main__':
         mol_list_train = list(read_delimited_file('train.smi'))
         mol_list_val = list(read_delimited_file('valid.smi'))
         
-        train_data = md.Dataset(mol_list_train, None, vocabulary)
-        test_data = md.Dataset(mol_list_val, None, vocabulary)
+        train_data = md.Dataset(mol_list_train, None, s_vocab)
+        test_data = md.Dataset(mol_list_val, None, s_vocab)
         train_iter = tud.DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=train_data.collate_fn, drop_last=True, num_workers=4, pin_memory=True)
         valid_iter = tud.DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=test_data.collate_fn, drop_last=True, num_workers=4, pin_memory=True)
     
@@ -313,8 +312,8 @@ if __name__ == '__main__':
         target_list_val.extend(target_list2_val)
         
 
-        train_data = md.Dataset(mol_list_train, target_list_train, vocabulary)
-        val_data = md.Dataset(mol_list_val, target_list_val, vocabulary)
+        train_data = md.Dataset(mol_list_train, target_list_train, s_vocab)
+        val_data = md.Dataset(mol_list_val, target_list_val, s_vocab)
         train_iter = tud.DataLoader(train_data, args.batch_size, collate_fn=train_data.collate_fn, shuffle=True)
         val_iter = tud.DataLoader(val_data, args.batch_size, collate_fn=val_data.collate_fn, shuffle=True)
         
@@ -384,7 +383,7 @@ if __name__ == '__main__':
         gen_smi=[]
         for i in range(args.num):
             ybar = greedy_decode(transformer, max_len=100, k=args.topk, start_symbol=BOS_IDX, EOS_IDX=EOS_IDX, target=_target, device=DEVICE, EMB_SIZE=EMB_SIZE).flatten()
-            ybar = vocabulary.decode(ybar.to('cpu').data.numpy())
+            ybar = s_vocab.decode(ybar.to('cpu').data.numpy())
             gen_smi.append(ybar)
         gen=pd.DataFrame(gen_smi)
         gen.to_csv(args.inferpath+"/{0}.txt".format(_target),header=None,index=False)
