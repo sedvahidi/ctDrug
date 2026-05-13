@@ -13,10 +13,10 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 import sys
-from model_auto_gated import Seq2SeqTransformer, PositionalEncoding, generate_square_subsequent_mask, create_mask
+from model_auto import Seq2SeqTransformer, PositionalEncoding, generate_square_subsequent_mask, create_mask
 from utils import top_k_top_p_filtering, open_file, read_csv_file, load_sets
 import vocabulary as mv
-import dataset_gated as md
+import dataset as md
 import torch.utils.data as tud
 from utils import read_delimited_file
 import os.path
@@ -27,30 +27,15 @@ import io
 import time
 from topk import topk_filter
 
-def freeze_backbone(model):
-    for name, param in model.named_parameters():
-        if any(k in name for k in [
-            "self_attn", 
-            "linear1", "linear2", 
-            "norm1","norm2", "norm3",
-            "tgt_tok_emb",
-            "generator"
-        ]):
-            param.requires_grad = False
-
-def unfreeze_all(model):
-    for param in model.parameters():
-        param.requires_grad = True
-        
 # === unified checkpoint helpers ===
 def save_checkpoint(checkpoint, filename="checkpoint_last.pth"):
     torch.save(checkpoint, filename)
     print(f"Checkpoint saved at {filename}")
 
-def load_checkpoint(filename, model, optimizer=None, scheduler=None, map_location=None):
+def load_checkpoint(filename, model, optimizer=None, scheduler=None, map_location=None, strict=True):
     print(f"Loading checkpoint from {filename}")
     checkpoint = torch.load(filename, map_location=map_location)
-    model.load_state_dict(checkpoint['state_dict'])
+    model.load_state_dict(checkpoint['state_dict'],strict=strict)
     if optimizer is not None and checkpoint.get('optimizer') is not None:
         optimizer.load_state_dict(checkpoint['optimizer'])
     if scheduler is not None and checkpoint.get('scheduler') is not None:
@@ -59,6 +44,14 @@ def load_checkpoint(filename, model, optimizer=None, scheduler=None, map_locatio
     best_val_loss = checkpoint.get('best_val_loss', float('inf'))
     return model, optimizer, scheduler, start_epoch, best_val_loss
 
+#loading protein embeddings for teacher
+pro_emb = pd.read_json('seqID_embedding.json', orient='records') 
+pro_emb['embedding'] = pro_emb['embedding'].apply(np.array)
+seqid_to_emb = dict(zip(pro_emb['seq_id'], pro_emb['embedding']))
+seqid_to_emb = {
+    k: torch.tensor(v, dtype=torch.float32)
+    for k, v in seqid_to_emb.items()
+}
 torch.manual_seed(0)
 
 def evaluate(model, valid_iter, device, epoch, EMB_SIZE, loss_fn=None):
@@ -73,14 +66,13 @@ def evaluate(model, valid_iter, device, epoch, EMB_SIZE, loss_fn=None):
                 _drg, _target = batch
 
             drg = _drg.transpose(0, 1).to(device)
-            
             drg_input = drg[:-1, :]
             drg_mask, drg_padding_mask = create_mask(drg_input)
 
             if _target is None:
                 target_stu = torch.zeros((drg_input.size(1), EMB_SIZE), dtype=torch.float).to(device)
             else:
-                target_stu=_target.to(device) ########new
+                target_stu = torch.stack([seqid_to_emb[t] for t in _target]).to(device, non_blocking=True)
 
             logits = model(drg_input, drg_mask, drg_padding_mask, target_stu)
             drg_out = drg[1:, :]
@@ -88,7 +80,8 @@ def evaluate(model, valid_iter, device, epoch, EMB_SIZE, loss_fn=None):
             logits_flat = logits.reshape(-1, logits.shape[-1])
             labels_flat = drg_out.reshape(-1)
             ce_loss = loss_fn(logits_flat, labels_flat) 
-            total_loss += ce_loss.item()
+            loss = ce_loss 
+            total_loss += loss.item()
             n_batches += 1
 
     avg_loss = total_loss / n_batches
@@ -98,11 +91,12 @@ def evaluate(model, valid_iter, device, epoch, EMB_SIZE, loss_fn=None):
 def train_epoch(model, train_iter, optimizer, device, epoch, EMB_SIZE, loss_fn=None):
     model.train()
     total_loss = 0
+    running_loss = 0.0
     for idx, _drg in enumerate(train_iter):
         _target = None
         if type(_drg) is tuple:
             _drg, _target = _drg
-
+            
         drg = _drg.transpose(0, 1).to(device)
         drg_input = drg[:-1, :]
         drg_mask, drg_padding_mask = create_mask(drg_input)
@@ -110,21 +104,23 @@ def train_epoch(model, train_iter, optimizer, device, epoch, EMB_SIZE, loss_fn=N
         if _target is None:
             target_stu = torch.zeros((drg_input.size(1), EMB_SIZE), dtype=torch.float).to(device)
         else:
-            target_stu=_target.to(device) ########new
+            target_stu = torch.stack([seqid_to_emb[t] for t in _target]).to(device, non_blocking=True)
+
         logits = model(drg_input, drg_mask, drg_padding_mask, target_stu) 
-       
+        optimizer.zero_grad()
         drg_out = drg[1:,:]
         ce_loss = loss_fn(logits.reshape(-1, logits.shape[-1]), drg_out.reshape(-1)) 
         
         loss = ce_loss 
-        optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.3) ##############new
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
+        running_loss += loss.detach()
         if idx % 100 == 0:
-            print('Train Epoch: {}\t Loss: {:.6f}'.format(epoch, loss.item()))     
-        total_loss += loss.item()
+            avg_loss = (running_loss / (idx + 1)).item()
+            print(f'Train Epoch: {epoch}\t Loss: {avg_loss:.6f}')    
+        total_loss = running_loss.item()
 
     print('====> Epoch: {0} total loss: {1:.4f}.'.format(epoch, total_loss))
 
@@ -132,30 +128,23 @@ def train_epoch(model, train_iter, optimizer, device, epoch, EMB_SIZE, loss_fn=N
  
 def greedy_decode(model, max_len, k, start_symbol, EOS_IDX, target, device, EMB_SIZE):
 
-    ys = torch.ones(1, 1).fill_(start_symbol).long().to(device)
+    ys = torch.ones(1, 1).fill_(start_symbol).type(torch.long).to(device)
     b = 1
     if target == "0":
         _target = torch.zeros((b, EMB_SIZE), dtype=torch.float).to(device)
     else:
-        _target = target.unsqueeze(0).to(device)
+        _target = torch.FloatTensor(seqid_to_emb[target]).unsqueeze(0).to(device)
     for i in range(max_len-1):
         
         drg_mask = (generate_square_subsequent_mask(ys.size(0))
                                     .type(torch.bool)).to(device)
-        drg_padding_mask = (ys == PAD_IDX).transpose(0, 1)
-        
-        # forward pass
-        logits = model(ys, drg_mask, drg_padding_mask, _target)
-        # take last step
-        logits = logits[-1, :, :]   # (B=1, vocab)
-        
-        #logits = topk_filter(logits, top_k=k)
-        #probs = F.softmax(logits, dim=-1)
-        #next_word = torch.multinomial(probs, 1).item()
-        
-        logits = topk_filter(logits, top_k=20)
-        probs = F.softmax(logits / 0.7, dim=-1)
-        next_word = torch.multinomial(probs, 1).item()
+        out = model.decode(ys, drg_mask, _target)
+        out = out.transpose(0, 1)
+        prob = model.generator(out[:, -1]) #[b, vocab_size]
+        pred_proba_t = topk_filter(prob, top_k=30) #[b, vocab_size]
+        probs = pred_proba_t.softmax(dim=1) #[b, vocab_size]
+        next_word = torch.multinomial(probs, 1)
+        next_word = next_word.item()
         
         # append
         ys = torch.cat(
@@ -181,9 +170,9 @@ if __name__ == '__main__':
     arg_parser.add_argument('--nhead', default=8, type=int)
     arg_parser.add_argument('--loadmodel', default=False, action="store_true")
     arg_parser.add_argument("--loaddata", default=False, action="store_true")
+    arg_parser.add_argument('--num', default=10000, type=int)
     arg_parser.add_argument('--inferpath', default='Results/', type=str)
     arg_parser.add_argument('--topk', default=30, type=int)
-    arg_parser.add_argument('--pretrain', default=False, action='store_true')
     args = arg_parser.parse_args()
     
     print('==========  Transformer x->x ==============')
@@ -195,64 +184,67 @@ if __name__ == '__main__':
     NUM_DECODER_LAYERS = args.layer
     NUM_EPOCHS = args.epoch
     
-    vocabulary = mv.tokens_struct()
-    PAD_IDX = vocabulary.pad
-    BOS_IDX = vocabulary.bos
-    EOS_IDX = vocabulary.eos
+    PAD_IDX = 0
+    BOS_IDX = 1
+    EOS_IDX = 2
+    mol_list0_train = list(read_delimited_file('train.smi'))
+    mol_list0_valid = list(read_delimited_file('valid_Chembl24.txt'))
+    mol_list0_test = list(read_delimited_file('test_Chembl24.txt'))
+    
+    mol_list1 = list(read_delimited_file('HTR1A_train.txt'))
+    mol_list1.extend(list(read_delimited_file('HTR1A_test.txt')))
+    mol_list1.extend(list(read_delimited_file('HTR1A_valid.txt')))
+    mol_list1.extend(list(read_delimited_file('DRD2_train.txt')))
+    mol_list1.extend(list(read_delimited_file('DRD2_test.txt')))
+    mol_list1.extend(list(read_delimited_file('DRD2_valid.txt')))
+
+    mol_list = mol_list0_train
+    mol_list.extend(mol_list0_test) 
+    mol_list.extend(mol_list1)
+    
+    vocabulary = mv.create_vocabulary(smiles_list=mol_list, tokenizer=mv.SMILESTokenizer())
+
+    BATCH_SIZE = args.batch_size
+    SRC_VOCAB_SIZE = len(vocabulary)
+    DRG_VOCAB_SIZE = len(vocabulary)
     
     DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     
     BATCH_SIZE = args.batch_size
-    SRC_VOCAB_SIZE = vocabulary.get_tokens_length()
-    drg_VOCAB_SIZE = vocabulary.get_tokens_length()
     
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     transformer = Seq2SeqTransformer(NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS, 
-                                 EMB_SIZE, SRC_VOCAB_SIZE, drg_VOCAB_SIZE,
+                                 EMB_SIZE, SRC_VOCAB_SIZE, DRG_VOCAB_SIZE,
                                  FFN_HID_DIM, args=args)
 
     for p in transformer.parameters():
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
 
-    #lr=0.0001#for pretraining
-    """optimizer = torch.optim.Adam(
-        transformer.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9
-    )"""
-    #lr=1e-5#for finetuning
-    if args.pretrain:
-        lr = 5e-7
-    else:
-        lr = 1e-4   
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, transformer.parameters()),lr=lr) #######warm_up lr
-        
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95) 
-    
-    
-    patience=12
-    
     if args.mode == 'train':
-        mol_list_train = list(read_delimited_file('train.smi'))
-        mol_list_val = list(read_delimited_file('valid.smi'))
-        
-        print("sampling 20 percent of data.")
+        lr=0.0001
+        patience=12
+    elif args.mode == 'finetune':
+        lr=0.0001#1e-6
+        patience=5
 
-        np.random.seed(42)  # عدد ثابت
-        mol_list_train = np.random.choice(mol_list_train, size=int(0.2 * len(mol_list_train)), replace=False)
-        mol_list_val = np.random.choice(mol_list_val, size=int(0.2 * len(mol_list_val)), replace=False)
-        
-        train_data = md.Dataset(mol_list_train, None, vocabulary)
-        test_data = md.Dataset(mol_list_val, None, vocabulary)
+    if args.mode == 'train':
+        optimizer = torch.optim.Adam(transformer.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95) 
+       
+        mol_list0_train = list(read_delimited_file('train_Chembl24.txt'))
+        mol_list0_valid = list(read_delimited_file('valid_Chembl24.txt'))
+        train_data = md.Dataset(mol_list0_train, vocabulary, mv.SMILESTokenizer())
+        valid_data = md.Dataset(mol_list0_valid, vocabulary, mv.SMILESTokenizer())
+       
         train_iter = tud.DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=train_data.collate_fn, drop_last=True, num_workers=4, pin_memory=True)
-        valid_iter = tud.DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=test_data.collate_fn, drop_last=True, num_workers=4, pin_memory=True)
+        valid_iter = tud.DataLoader(valid_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=valid_data.collate_fn, drop_last=True, num_workers=4, pin_memory=True)
     
         transformer = transformer.to(DEVICE)
 
         min_loss, val_loss = float('inf'), float('inf')
         epochs_no_improve = 0
         start_epoch =1
-
         if args.loadmodel:
             print("loading checkpoint")
             transformer, optimizer, scheduler, start_epoch, best_val_loss= load_checkpoint(
@@ -264,7 +256,7 @@ if __name__ == '__main__':
         best_checkpoint = None
         last_checkpoint = None
         for epoch in range(start_epoch, NUM_EPOCHS+1):
-            try:
+            try:    
                 start_time = time.time()
                 train_loss = train_epoch(transformer, train_iter, optimizer, DEVICE, epoch, EMB_SIZE, loss_fn)
                 scheduler.step()
@@ -290,7 +282,7 @@ if __name__ == '__main__':
                 if best_checkpoint is not None:
                     save_checkpoint(best_checkpoint, filename=f"{args.path}_best.pth")
                 if last_checkpoint is not None:   
-                    torch.save(last_checkpoint, filename=f"{args.path}_last.pth")
+                    torch.save(last_checkpoint, f"{args.path}_last.pth")
                 print(f"Checkpoint saved at {filename}")
                 exit(0)
             
@@ -303,7 +295,7 @@ if __name__ == '__main__':
                     'epochs_no_improve': epochs_no_improve
                 }
               
-            if best_checkpoint is not None and epoch % 10 ==0:
+            if best_checkpoint is not None and epoch % 5 ==0:
                 save_checkpoint(best_checkpoint, filename=f"{args.path}_best.pth")
                 print('Saved best model (val loss)')
             
@@ -317,80 +309,58 @@ if __name__ == '__main__':
             print('Saved best model (val loss)')
 
     elif args.mode == 'finetune':
+        optimizer = torch.optim.Adam(transformer.parameters(), lr=lr, betas=(0.9, 0.98), eps=1e-9)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95) 
+        from Mol_target_dataloader.utils import read_csv_file
+        import Mol_target_dataloader.dataset as md
+       
+        mol_list_train = list(read_delimited_file('HTR1A_train.txt'))
+        target_list_train = ['P08908'] * len(mol_list_train) 
 
-        train_data = torch.load("targetdiff/train_embeddings.pt", map_location="cpu")
-        val_data = torch.load("targetdiff/val_embeddings.pt", map_location="cpu")
-        
-        print("sampling 20 percent of data.")
-        import random
+        mol_list_val = list(read_delimited_file('HTR1A_valid.txt'))
+        target_list_val = ['P08908'] * len(mol_list_val) 
 
-        n = len(train_data["embeddings"])
-        sample_size = int(0.2 * n)
-        indices = random.sample(range(n), sample_size)
-        train_data = {
-            key: [value[i] for i in indices]
-            for key, value in train_data.items()
-        }
+        mol_list2_train = list(read_delimited_file('DRD2_train.txt'))
+        target_list2_train = ['P14416'] * len(mol_list2_train) 
 
-        target_list_train = train_data["embeddings"]
-        mol_list_train = train_data["smiles"]
+        mol_list2_val = list(read_delimited_file('DRD2_valid.txt'))
+        target_list2_val = ['P14416'] * len(mol_list2_val) 
+        
+        
+        mol_list_train.extend(mol_list2_train)
+        target_list_train.extend(target_list2_train)
+        mol_list_val.extend(mol_list2_val)
+        target_list_val.extend(target_list2_val)
+        
 
-        target_list_val = val_data["embeddings"]
-        mol_list_val = val_data["smiles"]
-        
-        
-        train_data = md.Dataset(mol_list_train, target_list_train, vocabulary)
-        val_data = md.Dataset(mol_list_val, target_list_val, vocabulary)
-        
-        train_iter = tud.DataLoader(train_data, args.batch_size, collate_fn=train_data.collate_fn, shuffle=True)
-        val_iter = tud.DataLoader(val_data, args.batch_size, collate_fn=val_data.collate_fn, shuffle=True)
-        
+        train_data = md.Dataset(mol_list_train, target_list_train, vocabulary, mv.SMILESTokenizer())
+        val_data = md.Dataset(mol_list_val, target_list_val, vocabulary, mv.SMILESTokenizer())
+
+        train_iter = tud.DataLoader(train_data, args.batch_size, collate_fn=train_data.collate_fn, shuffle=True)#, num_workers=4, pin_memory=True, persistent_workers=True)
+        val_iter = tud.DataLoader(val_data, args.batch_size, collate_fn=val_data.collate_fn, shuffle=True)#, num_workers=4, pin_memory=True, persistent_workers=True)
+
         transformer = transformer.to(DEVICE)
-        if args.pretrain:
-            checkpoint = torch.load("base_gated_best.pth", map_location=DEVICE)
-            transformer.load_state_dict(checkpoint['state_dict'], strict=False)
-            print("Loaded pretrained model")
-        else:
-            print("Training from scratch (NO PRETRAIN)")
-        
-        # init          
-        for layer in transformer.transformer_decoder.layers:
-            layer.alpha.data = torch.tensor(0.001).to(DEVICE)
+        transformer,*_= load_checkpoint(
+                "base_chembl_best.pth", model=transformer,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                map_location=DEVICE,
+            )
+        #transformer.load_state_dict(torch.load("model_base_1024.h5"))
 
         # === checkpoint start ===
         min_loss, val_loss = float('inf'), float('inf')
         epochs_no_improve = 0
         start_epoch = 1
-        num_warmup_epochs = 10
-        
         if args.loadmodel:
             print("loading checkpoint")
             transformer, optimizer, scheduler, start_epoch, best_val_loss= load_checkpoint(
-                args.path, transformer, optimizer, scheduler
+                args.path, transformer
             )
             min_loss=best_val_loss
-        print(optimizer)
     
         
         for epoch in range(start_epoch, NUM_EPOCHS+1):
-            # ---- warmup ----
-            if epoch == 1:
-                freeze_backbone(transformer)
-
-            if epoch <= num_warmup_epochs:
-                transformer.phase = "warmup"
-            if epoch == num_warmup_epochs + 1:
-                transformer.phase = "full"
-                unfreeze_all(transformer)
-
-                optimizer = torch.optim.Adam(
-                    transformer.parameters(),
-                    lr=lr
-                )
-
-                scheduler = torch.optim.lr_scheduler.StepLR(
-                    optimizer, step_size=1, gamma=0.95
-                )
             start_time = time.time()
             train_loss = train_epoch(transformer, train_iter, optimizer, DEVICE, epoch,EMB_SIZE, loss_fn=loss_fn)
 
@@ -424,38 +394,20 @@ if __name__ == '__main__':
         if args.device == 'cpu':
             transformer.load_state_dict(torch.load(args.path,  map_location=torch.device('cpu')))
         else:
-            transformer, _, _, _, _ = load_checkpoint(
-                args.path, transformer, map_location=DEVICE
+            transformer, optimizer, scheduler, start_epoch, best_val_loss= load_checkpoint(
+                args.path, transformer
             )
-
         transformer.to(DEVICE)
         transformer.eval()
-        data = torch.load("targetdiff/test_embeddings.pt")
-        gen_results = []
-
-        for sample in data:
-            protein_emb = sample["embedding"]
-            ybar = greedy_decode(
-                transformer,
-                max_len=100,
-                k=30,
-                EMB_SIZE=EMB_SIZE,
-                start_symbol=BOS_IDX,
-                EOS_IDX=EOS_IDX,
-                target=protein_emb,
-                device=DEVICE
-            ).flatten()
-
-            smiles = vocabulary.decode(ybar.cpu().numpy())
-
-            gen_results.append({
-                "id": sample["id"],
-                "smiles": smiles
-            })
-
-        import pandas as pd
-        df = pd.DataFrame(gen_results)
-        df.to_csv("Results/20data/layered_FFN_1024/gated/targetdiff/generated_test_nopre.csv", index=False)
+        _target = args.target
+        print('Target: {0}'.format(_target))
+        gen_smi=[]
+        for i in range(args.num):
+            ybar = greedy_decode(transformer, max_len=100, k=args.topk, start_symbol=BOS_IDX, EOS_IDX=EOS_IDX, target=_target, device=DEVICE, EMB_SIZE=EMB_SIZE).flatten()
+            ybar = mv.SMILESTokenizer().untokenize(vocabulary.decode(ybar.to('cpu').data.numpy()))
+            gen_smi.append(ybar)
+        gen=pd.DataFrame(gen_smi)
+        gen.to_csv(args.inferpath+"/{0}.txt".format(_target),header=None,index=False)
        
 
     
